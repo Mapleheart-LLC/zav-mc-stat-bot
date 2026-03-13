@@ -4,13 +4,16 @@ import aiohttp
 import os
 import logging
 import json
+import sys
 from pathlib import Path
 from typing import Any, Optional, cast
 
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(asctime)s %(levelname)s [%(name)s] %(message)s'
+    format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger('mc-status-bot')
 
@@ -43,6 +46,27 @@ SETTINGS_FILE = Path('data/settings.json')
 intents = getattr(discord, 'Intents').default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+
+
+async def resolve_text_channel() -> Optional[discord.TextChannel]:
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(CHANNEL_ID)
+        except discord.NotFound:
+            logger.error('Channel with id %s was not found', CHANNEL_ID)
+            return None
+        except discord.Forbidden:
+            logger.error('Missing permission to fetch channel %s', CHANNEL_ID)
+            return None
+        except discord.HTTPException:
+            logger.exception('HTTP error while fetching channel %s', CHANNEL_ID)
+            return None
+
+    if not isinstance(channel, discord.TextChannel):
+        logger.error('Channel %s is not a text channel', CHANNEL_ID)
+        return None
+    return channel
 
 
 def load_message_id() -> Optional[int]:
@@ -149,6 +173,7 @@ async def delete_old_status_embeds(channel: discord.TextChannel, keep_message_id
 
 
 async def publish_status_embed() -> bool:
+    logger.info('Publishing status embed (ip_visible=%s)', load_settings().get('show_ip', False))
     url = f'https://api.mcsrvstat.us/3/{MINECRAFT_IP}'
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -158,12 +183,8 @@ async def publish_status_embed() -> bool:
                 return False
             response = await resp.json(content_type=None)
 
-    channel = bot.get_channel(CHANNEL_ID)
+    channel = await resolve_text_channel()
     if not channel:
-        logger.error('Could not find channel with id %s', CHANNEL_ID)
-        return False
-    if not isinstance(channel, discord.TextChannel):
-        logger.error('Channel %s is not a text channel', CHANNEL_ID)
         return False
 
     settings = load_settings()
@@ -193,13 +214,18 @@ async def publish_status_embed() -> bool:
 
 @bot.event
 async def on_ready():
-    logger.info('Logged in as %s', bot.user)
+    logger.info('Logged in as %s | prefix=%s | channel_id=%s | role_id=%s', bot.user, COMMAND_PREFIX, CHANNEL_ID, TOGGLE_ROLE_ID)
+    try:
+        await publish_status_embed()
+    except Exception:
+        logger.exception('Initial status publish failed during on_ready')
     if not update_embed.is_running():
         update_embed.start()
 
 @tasks.loop(minutes=5)
 async def update_embed():
     try:
+        logger.info('Running scheduled status update')
         await publish_status_embed()
 
     except aiohttp.ClientError:
