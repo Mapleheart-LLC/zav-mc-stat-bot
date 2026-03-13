@@ -1,0 +1,14 @@
+## Add your compose file here
+services:
+  mc-discord-bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - CHANNEL_ID=${CHANNEL_ID}
+      - MINECRAFT_IP=${MINECRAFT_IP}
+    volumes:
+      - bot_data:/app/data
+
+volumes:
+  bot_data: {}
