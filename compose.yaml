@@ -7,6 +7,9 @@ services:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - CHANNEL_ID=${CHANNEL_ID}
       - MINECRAFT_IP=${MINECRAFT_IP}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - COMMAND_PREFIX=${COMMAND_PREFIX:-!}
+      - TOGGLE_ROLE_ID=${TOGGLE_ROLE_ID:-0}
     volumes:
       - bot_data:/app/data
 
