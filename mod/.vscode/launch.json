@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "java",
+      "request": "launch",
+      "name": "Server",
+      "presentation": {
+        "group": "Mod Development - Mothers-Ledger",
+        "order": 0
+      },
+      "projectName": "Mothers-Ledger",
+      "mainClass": "net.neoforged.devlaunch.Main",
+      "args": [
+        "@C:\\Users\\techd\\Documents\\GitHub\\zav-mc-stat-bot\\mod\\build\\moddev\\serverRunProgramArgs.txt"
+      ],
+      "vmArgs": [
+        "@C:\\Users\\techd\\Documents\\GitHub\\zav-mc-stat-bot\\mod\\build\\moddev\\serverRunVmArgs.txt",
+        "-Dfml.modFolders\u003dmothersledger%%C:\\Users\\techd\\Documents\\GitHub\\zav-mc-stat-bot\\mod\\bin\\main"
+      ],
+      "cwd": "${workspaceFolder}\\run",
+      "env": {},
+      "console": "internalConsole",
+      "shortenCommandLine": "none"
+    }
+  ]
+}

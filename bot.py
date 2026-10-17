@@ -2,6 +2,7 @@ import asyncio
 import discord
 from discord.ext import tasks, commands
 import aiohttp
+from aiohttp import web
 import os
 import logging
 import json
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dashboard import build_dashboard, build_server_embed
+from quest_api import QuestApi
 from status import InvalidStatusResponse, fetch_status
 from storage import Store
 
@@ -48,6 +50,13 @@ store = Store(DATABASE_PATH)
 http_session: Optional[aiohttp.ClientSession] = None
 last_polled: dict[int, float] = {}
 last_retention: float = 0
+quest_api_runner: Optional[web.AppRunner] = None
+QUEST_API_SECRET = os.environ.get('MOTHERS_LEDGER_SECRET', '').strip()
+QUEST_API_HOST = os.environ.get('QUEST_API_HOST', '127.0.0.1').strip() or '127.0.0.1'
+try:
+    QUEST_API_PORT = int(os.environ.get('QUEST_API_PORT', '8765'))
+except ValueError:
+    QUEST_API_PORT = 8765
 
 intents = getattr(discord, 'Intents').default()
 intents.message_content = True
@@ -55,12 +64,36 @@ intents.message_content = True
 
 class StatusBot(commands.Bot):
     async def close(self) -> None:
+        global quest_api_runner
+        if quest_api_runner is not None:
+            await quest_api_runner.cleanup()
+            quest_api_runner = None
         if http_session is not None and not http_session.closed:
             await http_session.close()
         await super().close()
 
 
 bot = StatusBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+
+
+async def start_quest_api() -> None:
+    global quest_api_runner
+    if not QUEST_API_SECRET:
+        logger.info('Mothers Ledger API disabled; MOTHERS_LEDGER_SECRET is unset')
+        return
+    if quest_api_runner is not None:
+        return
+
+    runner = web.AppRunner(QuestApi(store, QUEST_API_SECRET).app, access_log=None)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, QUEST_API_HOST, QUEST_API_PORT)
+        await site.start()
+    except Exception:
+        await runner.cleanup()
+        raise
+    quest_api_runner = runner
+    logger.info('Mothers Ledger API listening on %s:%s', QUEST_API_HOST, QUEST_API_PORT)
 
 
 def load_message_id() -> Optional[int]:
@@ -236,6 +269,10 @@ async def on_ready() -> None:
     await store.initialize()
     if http_session is None or http_session.closed:
         http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+    try:
+        await start_quest_api()
+    except OSError:
+        logger.exception('Could not start the Mothers Ledger API')
     await migrate_legacy_installation()
     for guild in bot.guilds:
         try:
@@ -244,6 +281,8 @@ async def on_ready() -> None:
             logger.exception('Initial status update failed for guild %s', guild.id)
     if not update_dashboards.is_running():
         update_dashboards.start()
+    if not deliver_quest_announcements.is_running():
+        deliver_quest_announcements.start()
 
 
 @tasks.loop(minutes=1)
@@ -262,6 +301,40 @@ async def before_dashboard_updates() -> None:
     await bot.wait_until_ready()
 
 
+@tasks.loop(seconds=10)
+async def deliver_quest_announcements() -> None:
+    announcements = await store.get_pending_quest_announcements(limit=20)
+    for announcement in announcements:
+        channel = await get_text_channel(announcement.channel_id)
+        if channel is None or channel.guild.id != announcement.guild_id:
+            await defer_quest_announcement(announcement.id, announcement.attempts)
+            continue
+        message = (
+            f'🌿 **{discord.utils.escape_markdown(announcement.team_name, as_needed=True)}** '
+            f'completed **{discord.utils.escape_markdown(announcement.quest_name, as_needed=True)}**.'
+        )
+        try:
+            await channel.send(message, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning('Could not announce quest completion to channel %s', channel.id)
+            await defer_quest_announcement(announcement.id, announcement.attempts)
+        else:
+            await store.mark_quest_announcement_sent(announcement.id)
+
+
+async def defer_quest_announcement(announcement_id: int, attempts: int) -> None:
+    delay = min(60 * 60, 30 * (2 ** min(attempts, 7)))
+    await store.defer_quest_announcement(
+        announcement_id,
+        retry_after=datetime.now(timezone.utc) + timedelta(seconds=delay),
+    )
+
+
+@deliver_quest_announcements.before_loop
+async def before_quest_announcements() -> None:
+    await bot.wait_until_ready()
+
+
 def can_manage_guild(ctx: commands.Context[Any]) -> bool:
     if not isinstance(ctx.author, discord.Member):
         return False
@@ -277,6 +350,7 @@ async def help_command(ctx: commands.Context[Any]) -> None:
     await ctx.reply(
         f'Commands: `{prefix}servers`, `{prefix}status [alias]`, '
         f'`{prefix}stats <alias> [1|7|30]`, `{prefix}refresh`, '
+        f'`{prefix}quest bind|sources|announce`, '
         f'`{prefix}server add|remove|channel|layout|interval|history`, '
         f'`{prefix}ip status|on|off`',
         mention_author=False,
@@ -494,6 +568,73 @@ async def server_history(ctx: commands.Context[Any], mode: str) -> None:
     await delete_tracked_message(guild_id, 'history')
     await publish_guild_dashboard(guild_id)
     await ctx.reply('The history message is now disabled; collected data is kept.', mention_author=False)
+
+
+@bot.group(name='quest', invoke_without_command=True)
+@commands.guild_only()
+async def quest_group(ctx: commands.Context[Any]) -> None:
+    await ctx.reply(
+        f'Use `{COMMAND_PREFIX}quest bind <source_id> #channel`, '
+        f'`{COMMAND_PREFIX}quest sources`, or '
+        f'`{COMMAND_PREFIX}quest announce <source_id> on|off`.',
+        mention_author=False,
+    )
+
+
+@quest_group.command(name='bind')
+@commands.check(can_manage_guild)
+async def quest_bind(
+    ctx: commands.Context[Any], source_id: str, channel: discord.TextChannel
+) -> None:
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', source_id):
+        await ctx.reply('Source IDs may contain letters, numbers, `.`, `_`, and `-`.', mention_author=False)
+        return
+    if channel.guild.id != ctx.guild.id:
+        await ctx.reply('Choose a text channel in this Discord server.', mention_author=False)
+        return
+    if not await store.bind_quest_source(source_id, ctx.guild.id, channel.id):
+        await ctx.reply('That source is already bound to a different Discord server.', mention_author=False)
+        return
+    await ctx.reply(
+        f'Bound quest source `{source_id}` to {channel.mention}. '
+        f'Announcements are off; enable them with `{COMMAND_PREFIX}quest announce {source_id} on`.',
+        mention_author=False,
+    )
+
+
+@quest_group.command(name='sources')
+@commands.guild_only()
+async def quest_sources(ctx: commands.Context[Any]) -> None:
+    sources = await store.list_quest_sources(ctx.guild.id)
+    if not sources:
+        await ctx.reply(
+            f'No quest sources are bound. Ask an admin to run `{COMMAND_PREFIX}quest bind <source_id> #channel`.',
+            mention_author=False,
+        )
+        return
+    lines = [
+        f'`{source.source_id}` → <#{source.channel_id}> · '
+        f'announcements {"on" if source.announcements_enabled else "off"}'
+        for source in sources
+    ]
+    await ctx.reply('\n'.join(lines), mention_author=False)
+
+
+@quest_group.command(name='announce')
+@commands.check(can_manage_guild)
+async def quest_announce(
+    ctx: commands.Context[Any], source_id: str, mode: str
+) -> None:
+    mode = mode.lower()
+    if mode not in {'on', 'off'}:
+        await ctx.reply('Choose `on` or `off`.', mention_author=False)
+        return
+    enabled = mode == 'on'
+    if not await store.set_quest_announcements(ctx.guild.id, source_id, enabled):
+        await ctx.reply('That source is not bound to this Discord server.', mention_author=False)
+        return
+    state = 'enabled' if enabled else 'disabled; queued announcements were cleared'
+    await ctx.reply(f'Quest announcements for `{source_id}` are {state}.', mention_author=False)
 
 
 @bot.command(name='ip')

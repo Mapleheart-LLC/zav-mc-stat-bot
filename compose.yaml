@@ -4,6 +4,8 @@ services:
       context: .
       dockerfile: dockerfile
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:${QUEST_API_PORT:-8765}:8765"
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - CHANNEL_ID=${CHANNEL_ID:-}
@@ -12,6 +14,9 @@ services:
       - COMMAND_PREFIX=${COMMAND_PREFIX:-!}
       - TOGGLE_ROLE_ID=${TOGGLE_ROLE_ID:-0}
       - DATABASE_PATH=/app/data/bot.sqlite3
+      - MOTHERS_LEDGER_SECRET=${MOTHERS_LEDGER_SECRET:-}
+      - QUEST_API_HOST=0.0.0.0
+      - QUEST_API_PORT=8765
     volumes:
       - bot_data:/app/data
 

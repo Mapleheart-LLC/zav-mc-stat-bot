@@ -1,0 +1,71 @@
+plugins {
+    id 'net.neoforged.moddev' version '2.0.140'
+}
+
+group = project.maven_group
+version = project.mod_version
+
+base {
+    archivesName = project.archives_base_name
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withSourcesJar()
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.architectury.dev/' }
+    maven { url = 'https://maven.ftb.dev/releases/' }
+    maven { url = 'https://maven.ftb.dev/snapshots/' }
+}
+
+dependencies {
+    implementation "dev.architectury:architectury-neoforge:${architectury_api_version}"
+    implementation("dev.ftb.mods:ftb-quests-neoforge:${ftb_quests_version}") { transitive = false }
+    implementation("dev.ftb.mods:ftb-library-neoforge:${ftb_library_version}") { transitive = false }
+    implementation("dev.ftb.mods:ftb-teams-neoforge:${ftb_teams_version}") { transitive = false }
+}
+
+neoForge {
+    version = neoforge_version
+
+    runs {
+        server {
+            server()
+            gameDirectory = project.file('run')
+            systemProperty 'mothersledger.dev', 'true'
+        }
+    }
+
+    mods {
+        mothersledger {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand(
+                version: project.version,
+                minecraftVersion: minecraft_version,
+                neoforgeVersionRange: neoforge_version_range,
+                neoforgeLoaderVersion: neoforge_loader_version,
+                architecturyVersion: architectury_api_version,
+                ftbQuestsVersion: ftb_quests_version,
+                ftbLibraryVersion: ftb_library_version,
+                ftbTeamsVersion: ftb_teams_version,
+                cobblemonMinVersion: cobblemon_min_version
+        )
+    }
+}

@@ -191,6 +191,131 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(now - timedelta(hours=1), summary.online_since)
         self.assertFalse(summary.streak_is_lower_bound)
 
+    async def test_quest_snapshots_replace_and_rank_team_progress(self) -> None:
+        await self.store.bind_quest_source('world', 100, 101)
+        synced_at = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        await self.store.save_quest_team_snapshot(
+            source_id='world',
+            team_id='team-a',
+            team_name='A Team',
+            progress_percent=50,
+            completed_count=3,
+            total_count=6,
+            completed_quests=['First', 'Second', 'Third'],
+            synced_at=synced_at,
+        )
+        await self.store.save_quest_team_snapshot(
+            source_id='world',
+            team_id='team-a',
+            team_name='A Team Renamed',
+            progress_percent=80,
+            completed_count=4,
+            total_count=5,
+            completed_quests=['First', 'Second', 'Third', 'Fourth'],
+            synced_at=synced_at + timedelta(minutes=1),
+        )
+        await self.store.save_quest_team_snapshot(
+            source_id='world',
+            team_id='team-b',
+            team_name='B Team',
+            progress_percent=80,
+            completed_count=3,
+            total_count=5,
+            completed_quests=['First', 'Second', 'Third'],
+            synced_at=synced_at,
+        )
+
+        leaderboard = await self.store.get_quest_leaderboard('world')
+        team = await self.store.get_quest_team_snapshot('world', 'team-a')
+
+        self.assertEqual(['team-a', 'team-b'], [row['team_id'] for row in leaderboard])
+        self.assertEqual(80, team['progress_percent'])
+        self.assertEqual('A Team Renamed', team['team_name'])
+        self.assertEqual(4, len(team['completed_quests']))
+
+    async def test_quest_link_code_is_single_use_and_enforces_uuid_uniqueness(self) -> None:
+        await self.store.bind_quest_source('world', 100, 101)
+        now = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        expires = now + timedelta(minutes=5)
+        self.assertTrue(
+            await self.store.create_quest_link_code(
+                source_id='world',
+                guild_id=100,
+                discord_user_id=200,
+                code_hash='hash-one',
+                expires_at=expires,
+                now=now,
+            )
+        )
+        self.assertTrue(
+            await self.store.consume_quest_link_code(
+                source_id='world',
+                code_hash='hash-one',
+                player_uuid='player-one',
+                player_name='Trainer One',
+                team_id='team-one',
+                now=now,
+            )
+        )
+        self.assertIsNone(
+            await self.store.get_quest_link('world', 100, 201)
+        )
+        self.assertEqual(
+            'team-one', (await self.store.get_quest_link('world', 100, 200))['team_id']
+        )
+        self.assertFalse(
+            await self.store.consume_quest_link_code(
+                source_id='world',
+                code_hash='hash-one',
+                player_uuid='player-two',
+                player_name='Trainer Two',
+                team_id='team-two',
+                now=now,
+            )
+        )
+
+        await self.store.create_quest_link_code(
+            source_id='world',
+            guild_id=100,
+            discord_user_id=201,
+            code_hash='hash-two',
+            expires_at=expires,
+            now=now,
+        )
+        self.assertFalse(
+            await self.store.consume_quest_link_code(
+                source_id='world',
+                code_hash='hash-two',
+                player_uuid='player-one',
+                player_name='Trainer One',
+                team_id='team-one',
+                now=now,
+            )
+        )
+
+    async def test_expired_quest_link_code_cannot_be_consumed(self) -> None:
+        await self.store.bind_quest_source('world', 100, 101)
+        now = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        await self.store.create_quest_link_code(
+            source_id='world',
+            guild_id=100,
+            discord_user_id=200,
+            code_hash='expired-hash',
+            expires_at=now - timedelta(seconds=1),
+            now=now - timedelta(minutes=6),
+        )
+
+        linked = await self.store.consume_quest_link_code(
+            source_id='world',
+            code_hash='expired-hash',
+            player_uuid='player-one',
+            player_name='Trainer One',
+            team_id='team-one',
+            now=now,
+        )
+
+        self.assertFalse(linked)
+
 
 if __name__ == '__main__':
     unittest.main()

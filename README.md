@@ -12,6 +12,8 @@ A Discord bot that maintains Minecraft server status dashboards per Discord serv
    DISCORD_TOKEN=your_bot_token
    COMMAND_PREFIX=!
    LOG_LEVEL=INFO
+   MOTHERS_LEDGER_SECRET=replace_with_openssl_rand_hex_32_output
+   QUEST_API_PORT=8765
    ```
 
    `TOGGLE_ROLE_ID` is optional. Members with Manage Server or Administrator can manage the bot; the configured role is an additional operator role.
@@ -25,6 +27,20 @@ A Discord bot that maintains Minecraft server status dashboards per Discord serv
    ```
 
 The bot stores its SQLite database in the persistent `bot_data` Docker volume. Keep that volume when rebuilding/updating the image.
+
+## Mothers Ledger integration
+
+The optional API listens inside the bot container on port `8765`; Compose publishes it to host loopback only. For a remote Minecraft server, terminate HTTPS at a reverse proxy and forward `POST /api/v1/events` to `http://127.0.0.1:8765/api/v1/events`. Generate a secret with `openssl rand -hex 32`, set the same value as `MOTHERS_LEDGER_SECRET` in the bot and Minecraft server environments, and never commit it.
+
+In Discord, an admin binds the server's stable source ID and configures the completion channel:
+
+```text
+!quest bind cobble-server #quest-completions
+!quest announce cobble-server on
+!quest sources
+```
+
+Set `MOTHERS_LEDGER_ENDPOINT` on the Minecraft server to the full HTTPS route (for example, `https://quests.example.org/api/v1/events`) and set `MOTHERS_LEDGER_SOURCE_ID` to the same source ID. The mod signs `POST`, the route, timestamp, nonce, and exact JSON body with HMAC-SHA256; the bot rejects stale timestamps, reused nonces, unbound sources, and duplicate event IDs. Announcements are names-only and never ping players.
 
 ## Commands
 
