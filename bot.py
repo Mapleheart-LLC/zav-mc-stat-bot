@@ -1,12 +1,20 @@
+import asyncio
 import discord
 from discord.ext import tasks, commands
 import aiohttp
 import os
 import logging
 import json
+import re
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional
+
+from dashboard import build_dashboard, build_server_embed
+from status import InvalidStatusResponse, fetch_status
+from storage import Store
 
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(
@@ -33,40 +41,26 @@ try:
 except ValueError:
     CHANNEL_ID = 0
 
-if not DISCORD_TOKEN:
-    raise RuntimeError('Missing required environment variable: DISCORD_TOKEN')
-if not MINECRAFT_IP:
-    raise RuntimeError('Missing required environment variable: MINECRAFT_IP')
-if CHANNEL_ID <= 0:
-    raise RuntimeError('Missing or invalid environment variable: CHANNEL_ID')
-
 MESSAGE_ID_FILE = Path('data/message_id.txt')
 SETTINGS_FILE = Path('data/settings.json')
+DATABASE_PATH = Path(os.environ.get('DATABASE_PATH', 'data/bot.sqlite3'))
+store = Store(DATABASE_PATH)
+http_session: Optional[aiohttp.ClientSession] = None
+last_polled: dict[int, float] = {}
+last_retention: float = 0
 
 intents = getattr(discord, 'Intents').default()
 intents.message_content = True
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 
 
-async def resolve_text_channel() -> Optional[discord.TextChannel]:
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(CHANNEL_ID)
-        except discord.NotFound:
-            logger.error('Channel with id %s was not found', CHANNEL_ID)
-            return None
-        except discord.Forbidden:
-            logger.error('Missing permission to fetch channel %s', CHANNEL_ID)
-            return None
-        except discord.HTTPException:
-            logger.exception('HTTP error while fetching channel %s', CHANNEL_ID)
-            return None
+class StatusBot(commands.Bot):
+    async def close(self) -> None:
+        if http_session is not None and not http_session.closed:
+            await http_session.close()
+        await super().close()
 
-    if not isinstance(channel, discord.TextChannel):
-        logger.error('Channel %s is not a text channel', CHANNEL_ID)
-        return None
-    return channel
+
+bot = StatusBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 
 
 def load_message_id() -> Optional[int]:
@@ -74,11 +68,6 @@ def load_message_id() -> Optional[int]:
         return None
     content = MESSAGE_ID_FILE.read_text(encoding='utf-8').strip()
     return int(content) if content.isdigit() else None
-
-
-def save_message_id(message_id: int) -> None:
-    MESSAGE_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MESSAGE_ID_FILE.write_text(str(message_id), encoding='utf-8')
 
 
 def load_settings() -> dict[str, bool]:
@@ -95,193 +84,458 @@ def load_settings() -> dict[str, bool]:
     return default_settings
 
 
-def save_settings(settings: dict[str, bool]) -> None:
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding='utf-8')
-
-
-def can_toggle_ip(member: discord.abc.User) -> bool:
-    if not isinstance(member, discord.Member):
-        return False
-    if member.guild_permissions.administrator:
-        return True
-    if TOGGLE_ROLE_ID <= 0:
-        return False
-    return any(role.id == TOGGLE_ROLE_ID for role in member.roles)
-
-
-def build_status_embed(response: dict[str, Any], show_ip: bool) -> discord.Embed:
-    online = response.get('online', False)
-    description = f"**IP:** `{MINECRAFT_IP}`" if show_ip else '**IP:** Hidden'
-
-    embed = discord.Embed(
-        title='🌿 Cobblemon Server Status',
-        description=description,
-        color=discord.Color.brand_green() if online else discord.Color.brand_red()
-    )
-
-    if online:
-        players = response.get('players', {}).get('online', 0)
-        max_players = response.get('players', {}).get('max', 0)
-        version = response.get('version', 'Unknown')
-        motd_list = response.get('motd', {}).get('clean', [])
-        motd = motd_list[0] if motd_list else ''
-
-        embed.add_field(name='Status', value='🟢 Online', inline=True)
-        embed.add_field(name='Players', value=f'{players}/{max_players}', inline=True)
-        embed.add_field(name='Version', value=version, inline=True)
-
-        if motd:
-            embed.add_field(name='MOTD', value=f'*{motd}*', inline=False)
-
-        embed.set_thumbnail(url=f'https://api.mcsrvstat.us/icon/{MINECRAFT_IP}')
-    else:
-        embed.add_field(name='Status', value='🔴 Offline', inline=True)
-        embed.add_field(name='Players', value='0/0', inline=True)
-
-    embed.set_footer(text='Updated automatically')
-    embed.timestamp = discord.utils.utcnow()
-    return embed
-
-
-async def delete_old_status_embeds(channel: discord.TextChannel, keep_message_id: Optional[int] = None) -> None:
-    bot_user = bot.user
-    if bot_user is None:
-        return
-    try:
-        async for old_message in channel.history(limit=50):
-            if keep_message_id and old_message.id == keep_message_id:
-                continue
-            if old_message.author.id != bot_user.id:
-                continue
-            if not old_message.embeds:
-                continue
-
-            first_embed = old_message.embeds[0]
-            if first_embed.title == '🌿 Cobblemon Server Status':
-                try:
-                    await old_message.delete()
-                    logger.info('Deleted old status embed message %s', old_message.id)
-                except discord.Forbidden:
-                    logger.warning('Missing permissions to delete old status message %s', old_message.id)
-                except discord.HTTPException:
-                    logger.warning('Failed deleting old status message %s due to HTTP error', old_message.id)
-    except discord.Forbidden:
-        logger.warning('Missing permissions to read channel history for cleanup')
-    except discord.HTTPException:
-        logger.warning('Failed to read channel history for cleanup due to HTTP error')
-
-
-async def publish_status_embed() -> bool:
-    logger.info('Publishing status embed (ip_visible=%s)', load_settings().get('show_ip', False))
-    url = f'https://api.mcsrvstat.us/3/{MINECRAFT_IP}'
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                logger.error('Server status request failed: HTTP %s', resp.status)
-                return False
-            response = await resp.json(content_type=None)
-
-    channel = await resolve_text_channel()
-    if not channel:
-        return False
-
-    settings = load_settings()
-    embed = build_status_embed(response, show_ip=settings.get('show_ip', False))
-    message_id = load_message_id()
-
-    if message_id:
+async def get_text_channel(channel_id: int) -> Optional[discord.TextChannel]:
+    channel = bot.get_channel(channel_id)
+    if channel is None:
         try:
-            msg = await channel.fetch_message(message_id)
-            await cast(Any, msg).edit(embed=embed)
-            logger.info('Updated status embed message %s', message_id)
-            return True
-        except discord.NotFound:
-            logger.warning('Tracked message %s was not found. Sending a new embed.', message_id)
-        except discord.Forbidden:
-            logger.exception('Missing permissions to edit message %s', message_id)
-            return False
-        except discord.HTTPException:
-            logger.exception('Failed to edit message %s due to Discord HTTP error', message_id)
-            return False
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.exception('Could not resolve dashboard channel %s', channel_id)
+            return None
+    if not isinstance(channel, discord.TextChannel):
+        logger.error('Dashboard destination %s is not a text channel', channel_id)
+        return None
+    return channel
 
-    await delete_old_status_embeds(channel)
-    msg = await cast(Any, channel).send(embed=embed)
-    save_message_id(msg.id)
-    logger.info('Sent new status embed message %s', msg.id)
+
+async def publish_guild_dashboard(guild_id: int) -> bool:
+    settings = await store.get_guild_settings(guild_id)
+    if settings.dashboard_channel_id is None:
+        return False
+    channel = await get_text_channel(settings.dashboard_channel_id)
+    if channel is None or channel.guild.id != guild_id:
+        return False
+
+    servers = await store.list_servers(guild_id)
+    samples = {server.id: await store.get_latest_status(server.id) for server in servers}
+    uptimes = {
+        server.id: await store.get_uptime_summary(
+            server.id,
+            interval_minutes=settings.poll_interval_minutes,
+        )
+        for server in servers
+    }
+    embeds = build_dashboard(servers, samples, settings, uptimes)
+    previous_messages = await store.list_messages(guild_id)
+    for message_key, embed in embeds.items():
+        previous = await store.get_message(guild_id, message_key)
+        message = None
+        if previous is not None and previous[0] == channel.id:
+            try:
+                message = await channel.fetch_message(previous[1])
+                await message.edit(embed=embed)
+            except discord.NotFound:
+                message = None
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception('Could not update dashboard message %s', previous[1])
+                return False
+        if message is None:
+            try:
+                message = await channel.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                logger.exception('Could not send dashboard message to %s', channel.id)
+                return False
+        await store.set_message(guild_id, message_key, channel.id, message.id)
+
+    for message_key, old_channel_id, message_id in previous_messages:
+        if message_key in embeds and old_channel_id == channel.id:
+            continue
+        old_channel = await get_text_channel(old_channel_id)
+        if old_channel is not None and old_channel.guild.id == guild_id:
+            try:
+                old_message = await old_channel.fetch_message(message_id)
+                await old_message.delete()
+            except discord.NotFound:
+                pass
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning('Could not remove stale dashboard message %s', message_id)
+        await store.delete_message(guild_id, message_key)
     return True
 
+
+async def delete_tracked_message(guild_id: int, message_key: str) -> None:
+    tracked = await store.get_message(guild_id, message_key)
+    if tracked is None:
+        return
+    channel = await get_text_channel(tracked[0])
+    if channel is not None and channel.guild.id == guild_id:
+        try:
+            message = await channel.fetch_message(tracked[1])
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning('Could not delete tracked message %s', tracked[1])
+    await store.delete_message(guild_id, message_key)
+
+
+async def refresh_guild(guild_id: int) -> bool:
+    global last_retention
+    last_polled[guild_id] = time.monotonic()
+    servers = await store.list_servers(guild_id)
+    if http_session is None:
+        return False
+
+    for server in servers:
+        checked_at = datetime.now(timezone.utc)
+        try:
+            status = await fetch_status(http_session, server.address)
+        except (aiohttp.ClientError, asyncio.TimeoutError, InvalidStatusResponse) as error:
+            logger.warning('Status request failed for %s: %s', server.alias, error)
+            await store.record_status(
+                server.id, checked_at=checked_at, online=None, error=type(error).__name__
+            )
+        except Exception:
+            logger.exception('Unexpected status failure for %s', server.alias)
+            await store.record_status(
+                server.id, checked_at=checked_at, online=None, error='Unexpected error'
+            )
+        else:
+            await store.record_status(
+                server.id,
+                checked_at=checked_at,
+                online=status.online,
+                players_online=status.players_online,
+                players_max=status.players_max,
+                version=status.version,
+                motd=status.motd,
+            )
+
+    if time.monotonic() - last_retention >= 24 * 60 * 60:
+        await store.prune_status_samples(before=datetime.now(timezone.utc) - timedelta(days=30))
+        last_retention = time.monotonic()
+    return await publish_guild_dashboard(guild_id)
+
+async def migrate_legacy_installation() -> None:
+    address = MINECRAFT_IP
+    if not address or CHANNEL_ID <= 0:
+        return
+    try:
+        channel = await bot.fetch_channel(CHANNEL_ID)
+    except discord.DiscordException:
+        logger.exception('Could not resolve legacy status channel %s', CHANNEL_ID)
+        return
+    if not isinstance(channel, discord.TextChannel):
+        logger.error('Legacy channel %s is not a text channel', CHANNEL_ID)
+        return
+    imported = await store.import_legacy(
+        guild_id=channel.guild.id,
+        channel_id=channel.id,
+        address=address,
+        message_id=load_message_id(),
+        show_ip=load_settings().get('show_ip', False),
+    )
+    if imported:
+        logger.info('Imported legacy single-server configuration for guild %s', channel.guild.id)
+
+
 @bot.event
-async def on_ready():
-    logger.info('Logged in as %s | prefix=%s | channel_id=%s | role_id=%s', bot.user, COMMAND_PREFIX, CHANNEL_ID, TOGGLE_ROLE_ID)
-    try:
-        await publish_status_embed()
-    except Exception:
-        logger.exception('Initial status publish failed during on_ready')
-    if not update_embed.is_running():
-        update_embed.start()
-
-@tasks.loop(minutes=5)
-async def update_embed():
-    try:
-        logger.info('Running scheduled status update')
-        await publish_status_embed()
-
-    except aiohttp.ClientError:
-        logger.exception('Network error while requesting server status')
-    except Exception:
-        logger.exception('Unexpected error in update loop')
+async def on_ready() -> None:
+    global http_session
+    logger.info('Logged in as %s | prefix=%s', bot.user, COMMAND_PREFIX)
+    await store.initialize()
+    if http_session is None or http_session.closed:
+        http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+    await migrate_legacy_installation()
+    for guild in bot.guilds:
+        try:
+            await refresh_guild(guild.id)
+        except Exception:
+            logger.exception('Initial status update failed for guild %s', guild.id)
+    if not update_dashboards.is_running():
+        update_dashboards.start()
 
 
-@update_embed.before_loop
-async def before_update_embed() -> None:
+@tasks.loop(minutes=1)
+async def update_dashboards() -> None:
+    for guild in bot.guilds:
+        try:
+            settings = await store.get_guild_settings(guild.id)
+            if time.monotonic() - last_polled.get(guild.id, 0) >= settings.poll_interval_minutes * 60:
+                await refresh_guild(guild.id)
+        except Exception:
+            logger.exception('Scheduled status update failed for guild %s', guild.id)
+
+
+@update_dashboards.before_loop
+async def before_dashboard_updates() -> None:
     await bot.wait_until_ready()
+
+
+def can_manage_guild(ctx: commands.Context[Any]) -> bool:
+    if not isinstance(ctx.author, discord.Member):
+        return False
+    permissions = ctx.author.guild_permissions
+    if permissions.administrator or permissions.manage_guild:
+        return True
+    return TOGGLE_ROLE_ID > 0 and any(role.id == TOGGLE_ROLE_ID for role in ctx.author.roles)
 
 
 @bot.command(name='help')
 async def help_command(ctx: commands.Context[Any]) -> None:
+    prefix = COMMAND_PREFIX
     await ctx.reply(
-        f'Commands: `{COMMAND_PREFIX}help`, `{COMMAND_PREFIX}refresh`, `{COMMAND_PREFIX}ip status`, `{COMMAND_PREFIX}ip on`, `{COMMAND_PREFIX}ip off`',
-        mention_author=False
+        f'Commands: `{prefix}servers`, `{prefix}status [alias]`, '
+        f'`{prefix}stats <alias> [1|7|30]`, `{prefix}refresh`, '
+        f'`{prefix}server add|remove|channel|layout|interval|history`, '
+        f'`{prefix}ip status|on|off`',
+        mention_author=False,
+    )
+
+
+@bot.command(name='servers')
+@commands.guild_only()
+async def servers_command(ctx: commands.Context[Any]) -> None:
+    guild_id = ctx.guild.id
+    servers = await store.list_servers(guild_id)
+    settings = await store.get_guild_settings(guild_id)
+    if not servers:
+        await ctx.reply(
+            f'No servers configured. Add one with `{COMMAND_PREFIX}server add <alias> <address>`.',
+            mention_author=False,
+        )
+        return
+    lines = [
+        f'**{server.alias}**: `{server.address}`' if settings.show_ip else f'**{server.alias}**'
+        for server in servers
+    ]
+    channel = f'<#{settings.dashboard_channel_id}>' if settings.dashboard_channel_id else 'not set'
+    await ctx.reply(
+        '\n'.join(lines)
+        + f'\nDashboard: {channel} | Layout: `{settings.layout}`'
+        + f' | Poll: `{settings.poll_interval_minutes}m`',
+        mention_author=False,
+    )
+
+
+@bot.command(name='status')
+@commands.guild_only()
+async def status_command(ctx: commands.Context[Any], alias: Optional[str] = None) -> None:
+    guild_id = ctx.guild.id
+    servers = await store.list_servers(guild_id)
+    if alias is None:
+        if len(servers) != 1:
+            await ctx.reply(f'Specify a server alias with `{COMMAND_PREFIX}status <alias>`.', mention_author=False)
+            return
+        server = servers[0]
+    else:
+        server = await store.get_server(guild_id, alias)
+    if server is None:
+        await ctx.reply('That server is not configured. Use the servers command to list entries.', mention_author=False)
+        return
+    settings = await store.get_guild_settings(guild_id)
+    sample = await store.get_latest_status(server.id)
+    uptime = await store.get_uptime_summary(
+        server.id,
+        interval_minutes=settings.poll_interval_minutes,
+    )
+    await ctx.reply(
+        embed=build_server_embed(
+            server,
+            sample,
+            show_ip=settings.show_ip,
+            uptime=uptime,
+        ),
+        mention_author=False,
+    )
+
+
+@bot.command(name='stats')
+@commands.guild_only()
+async def stats_command(ctx: commands.Context[Any], alias: str, days: int = 7) -> None:
+    if days not in {1, 7, 30}:
+        await ctx.reply('Choose a history window of `1`, `7`, or `30` days.', mention_author=False)
+        return
+    server = await store.get_server(ctx.guild.id, alias)
+    if server is None:
+        await ctx.reply('That server is not configured.', mention_author=False)
+        return
+    settings = await store.get_guild_settings(ctx.guild.id)
+    summary = await store.get_status_summary(server.id, days=days)
+    uptime = await store.get_uptime_summary(
+        server.id,
+        interval_minutes=settings.poll_interval_minutes,
+        hours=days * 24,
+    )
+    if summary.uptime_percent is None or uptime.coverage_percent is None:
+        await ctx.reply(f'No successful history is available for **{server.alias}** yet.', mention_author=False)
+        return
+    average = 'unknown' if summary.average_players is None else f'{summary.average_players:.1f}'
+    tracked_for = 'unknown'
+    if uptime.monitoring_since is not None:
+        elapsed = max(0, int((datetime.now(timezone.utc) - uptime.monitoring_since).total_seconds() // 3600))
+        tracked_for = f'{elapsed}h'
+    uptime_text = (
+        f'Inconclusive ({uptime.coverage_percent:.0f}% coverage)'
+        if uptime.coverage_percent < 80
+        else f'{uptime.uptime_percent:.2f}% ({uptime.coverage_percent:.0f}% coverage)'
+    )
+    await ctx.reply(
+        f'**{server.alias} · last {days} days**\n'
+        f'Uptime: **{uptime_text}** · tracking {tracked_for}\n'
+        f'Confirmed checks: {uptime.online_count}/{uptime.successful_count} online\n'
+        f'Average players: **{average}**',
+        mention_author=False,
     )
 
 
 @bot.command(name='refresh')
+@commands.guild_only()
+@commands.check(can_manage_guild)
 async def refresh_command(ctx: commands.Context[Any]) -> None:
-    if not can_toggle_ip(ctx.author):
-        await ctx.reply('You do not have permission to refresh the status message.', mention_author=False)
-        return
-    updated = await publish_status_embed()
-    if updated:
-        await ctx.reply('Status embed refreshed.', mention_author=False)
+    if await refresh_guild(ctx.guild.id):
+        await ctx.reply('Status dashboard refreshed.', mention_author=False)
     else:
-        await ctx.reply('Could not refresh the status embed. Check logs.', mention_author=False)
+        await ctx.reply(
+            f'Set a dashboard channel with `{COMMAND_PREFIX}server channel #channel` first.',
+            mention_author=False,
+        )
+
+
+@bot.group(name='server', invoke_without_command=True)
+@commands.guild_only()
+async def server_group(ctx: commands.Context[Any]) -> None:
+    await ctx.reply(
+        f'Use `{COMMAND_PREFIX}server add|remove|channel|layout|interval|history`. ',
+        mention_author=False,
+    )
+
+
+@server_group.command(name='add')
+@commands.check(can_manage_guild)
+async def server_add(ctx: commands.Context[Any], alias: str, *, address: str) -> None:
+    alias = alias.lower()
+    address = address.strip()
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,31}', alias):
+        await ctx.reply('Aliases must be 1-32 letters, numbers, `_` or `-`.', mention_author=False)
+        return
+    if (
+        not address or len(address) > 255 or any(char.isspace() for char in address)
+        or '://' in address or '/' in address
+    ):
+        await ctx.reply('Provide a hostname or IP address, optionally with a port.', mention_author=False)
+        return
+    if await store.get_server(ctx.guild.id, alias) is not None:
+        await ctx.reply('That alias is already in use in this Discord server.', mention_author=False)
+        return
+    await store.add_server(ctx.guild.id, alias, address)
+    await refresh_guild(ctx.guild.id)
+    await ctx.reply(f'Added Minecraft server **{alias}**.', mention_author=False)
+
+
+@server_group.command(name='remove')
+@commands.check(can_manage_guild)
+async def server_remove(ctx: commands.Context[Any], alias: str) -> None:
+    if not await store.remove_server(ctx.guild.id, alias):
+        await ctx.reply('That server is not configured.', mention_author=False)
+        return
+    await publish_guild_dashboard(ctx.guild.id)
+    await ctx.reply(f'Removed Minecraft server **{alias}**.', mention_author=False)
+
+
+@server_group.command(name='channel')
+@commands.check(can_manage_guild)
+async def server_channel(ctx: commands.Context[Any], channel: discord.TextChannel) -> None:
+    await store.configure_guild(ctx.guild.id, dashboard_channel_id=channel.id)
+    await publish_guild_dashboard(ctx.guild.id)
+    await ctx.reply(f'Dashboard channel set to {channel.mention}.', mention_author=False)
+
+
+@server_group.command(name='layout')
+@commands.check(can_manage_guild)
+async def server_layout(ctx: commands.Context[Any], layout: str) -> None:
+    layout = layout.lower()
+    if layout not in {'combined', 'per_server'}:
+        await ctx.reply('Choose `combined` or `per_server`.', mention_author=False)
+        return
+    await store.configure_guild(ctx.guild.id, layout=layout)
+    await publish_guild_dashboard(ctx.guild.id)
+    await ctx.reply(f'Dashboard layout set to `{layout}`.', mention_author=False)
+
+
+@server_group.command(name='interval')
+@commands.check(can_manage_guild)
+async def server_interval(ctx: commands.Context[Any], minutes: int) -> None:
+    if not 1 <= minutes <= 60:
+        await ctx.reply('Polling interval must be between 1 and 60 minutes.', mention_author=False)
+        return
+    await store.configure_guild(ctx.guild.id, poll_interval_minutes=minutes)
+    await ctx.reply(f'Polling interval set to **{minutes} minutes**.', mention_author=False)
+
+
+@server_group.command(name='history')
+@commands.check(can_manage_guild)
+async def server_history(ctx: commands.Context[Any], mode: str) -> None:
+    mode = mode.lower()
+    if mode not in {'on', 'off'}:
+        await ctx.reply('Choose `on` or `off`.', mention_author=False)
+        return
+
+    guild_id = ctx.guild.id
+    if mode == 'on':
+        settings = await store.get_guild_settings(guild_id)
+        if settings.dashboard_channel_id is None:
+            await ctx.reply(
+                f'Set a dashboard channel first with `{COMMAND_PREFIX}server channel #channel`.',
+                mention_author=False,
+            )
+            return
+        await store.configure_guild(guild_id, history_enabled=True)
+        if not await publish_guild_dashboard(guild_id):
+            await ctx.reply(
+                'History is enabled, but I could not publish the dashboard. Check my channel permissions.',
+                mention_author=False,
+            )
+            return
+        await ctx.reply('The history message is now enabled.', mention_author=False)
+        return
+
+    await store.configure_guild(guild_id, history_enabled=False)
+    await delete_tracked_message(guild_id, 'history')
+    await publish_guild_dashboard(guild_id)
+    await ctx.reply('The history message is now disabled; collected data is kept.', mention_author=False)
 
 
 @bot.command(name='ip')
+@commands.guild_only()
 async def ip_command(ctx: commands.Context[Any], mode: Optional[str] = None) -> None:
-    settings = load_settings()
-
+    settings = await store.get_guild_settings(ctx.guild.id)
     if mode is None or mode.lower() == 'status':
-        current = 'visible' if settings.get('show_ip', False) else 'hidden'
-        await ctx.reply(f'IP visibility is currently **{current}**.', mention_author=False)
+        visibility = 'visible' if settings.show_ip else 'hidden'
+        await ctx.reply(f'Server addresses are currently **{visibility}**.', mention_author=False)
         return
-
-    normalized = mode.lower()
-    if normalized not in {'on', 'off'}:
+    mode = mode.lower()
+    if mode not in {'on', 'off'}:
         await ctx.reply(f'Usage: `{COMMAND_PREFIX}ip on|off|status`', mention_author=False)
         return
-
-    if not can_toggle_ip(ctx.author):
-        await ctx.reply('You do not have permission to change IP visibility.', mention_author=False)
+    if not can_manage_guild(ctx):
+        await ctx.reply('You do not have permission to change address visibility.', mention_author=False)
         return
+    show_ip = mode == 'on'
+    await store.configure_guild(ctx.guild.id, show_ip=show_ip)
+    await publish_guild_dashboard(ctx.guild.id)
+    visibility = 'visible' if show_ip else 'hidden'
+    await ctx.reply(f'Server addresses are now **{visibility}**.', mention_author=False)
 
-    show_ip = normalized == 'on'
-    settings['show_ip'] = show_ip
-    save_settings(settings)
-    await publish_status_embed()
-    await ctx.reply(f'IP visibility set to **{"visible" if show_ip else "hidden"}**.', mention_author=False)
+
+@bot.event
+async def on_command_error(ctx: commands.Context[Any], error: commands.CommandError) -> None:
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.CheckFailure):
+        await ctx.reply('This command is unavailable here or you do not have permission.', mention_author=False)
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f'Missing argument: `{error.param.name}`.', mention_author=False)
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.reply(f'Check the command syntax with `{COMMAND_PREFIX}help`.', mention_author=False)
+        return
+    logger.error(
+        'Unhandled command error',
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    await ctx.reply('The command failed. Check the bot logs for details.', mention_author=False)
 
 
 @bot.event
@@ -298,4 +552,7 @@ async def on_resumed():
 async def on_error(event_method: str, *args, **kwargs):
     logger.exception('Unhandled discord.py error in event: %s', event_method)
 
-bot.run(DISCORD_TOKEN)
+if __name__ == '__main__':
+    if not DISCORD_TOKEN:
+        raise RuntimeError('Missing required environment variable: DISCORD_TOKEN')
+    bot.run(DISCORD_TOKEN)
